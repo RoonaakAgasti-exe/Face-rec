@@ -1,33 +1,65 @@
 # 🎯 Face Recognition Access Control System
 
-A real-time, dual-table face recognition system for access control — distinguishing **employees**, **frequent visitors**, **new walk-ins**, and **spoof attempts**, all logged to PostgreSQL with pgvector.
+A real-time face recognition system built with **ArcFace** and **PostgreSQL + pgvector**. It detects and identifies faces from a live webcam feed, distinguishes existing employees from new (unenrolled) ones, and logs attendance automatically — with anti-spoofing protection to block photos, screen replays, and masks.
 
 ---
 
-## 📐 Architecture
+## Recognition States
+
+![Recognition states](docs/recognition_states.png)
+
+The camera classifies every detected face into one of four states in real time:
+
+| Colour | State | Meaning |
+|--------|-------|---------|
+| 🟢 **Green** | EXISTING EMPLOYEE | Face matched in the database with high confidence (`dist < 0.35`) |
+| 🔵 **Cyan** | NEW EMPLOYEE | Face not enrolled — prompt to run `enroll_camera.py` |
+| 🟠 **Orange** | LOW CONFIDENCE | Weak match — may be an existing employee with poor angle or lighting (`0.35 ≤ dist < 0.55`) |
+| 🟡 **Yellow** | SPOOF DETECTED | Anti-spoof liveness check failed — photo, screen, or mask |
+
+---
+
+## Architecture
+
+![Architecture](docs/architecture.png)
 
 ```
-live_camera.py
-    │
-    ├─► InsightFace (buffalo_l)   — detection + 512-dim embedding
-    ├─► AntiSpoof model           — liveness check
-    │
-    ├─► employee_embeddings  (pgvector)  → GREEN  GATE OPEN
-    ├─► visitor_embeddings   (pgvector)  → BLUE   LOGGED
-    │
-    ├─► LOW CONFIDENCE match             → ORANGE  re-enroll prompt
-    ├─► NO MATCH                         → CYAN    terminal input → new_visitor_log
-    └─► SPOOF                            → YELLOW  ACCESS DENIED
+Camera feed
+    ↓  Face detection          every frame  (~20 ms)
+    ↓  Anti-spoof liveness     every 15 frames
+    ↓  ArcFace embedding       512-dim vector
+    ↓  pgvector cosine search  <=> operator
+    ├─ dist < 0.35   → EXISTING EMPLOYEE  → attendance_log (60 s cooldown)
+    ├─ dist < 0.55   → LOW CONFIDENCE     → flag on screen
+    └─ dist ≥ 0.55   → NEW EMPLOYEE       → prompt to enroll
 ```
 
-### Database Schema (4 tables)
+---
 
-| Table | Purpose |
-|---|---|
-| `employee_embeddings` | Permanent staff — emp_id, full_name, department, embedding |
-| `visitor_embeddings` | Pre-registered frequent visitors — visitor_id, full_name, phone, purpose, embedding |
-| `attendance_log` | Every verified pass-through (employee or frequent_visitor) |
-| `new_visitor_log` | Unknown walk-ins who typed their details |
+## Features
+
+- **New vs existing employee detection** — the camera distinguishes enrolled staff from completely new faces rather than just showing "unknown"
+- **Four-state face classification** — verified, low confidence, new employee, spoof
+- **Live enrollment** — add people directly from the webcam without pre-captured photos
+- **Anti-spoofing** — rejects printed photos, screen replays, and 3D masks
+- **Attendance logging** — every verified face is timestamped with a 60-second cooldown
+- **CSV export** — full attendance history exportable on demand
+- **Encrypted embeddings** — optional Fernet encryption for stored face vectors
+- **Threaded recognition** — detection runs every frame; heavier embedding/DB work runs in a background thread to maintain smooth FPS
+
+---
+
+## Tech Stack
+
+| Component | Technology |
+|-----------|------------|
+| Face recognition | InsightFace — ArcFace (buffalo_l) |
+| Anti-spoofing | InsightFace — MiniFASNet (antispoof) |
+| Vector search | PostgreSQL 17 + pgvector |
+| Database client | psycopg2 + pgvector-python |
+| Camera / video | OpenCV |
+| Encryption | cryptography (Fernet) |
+| Infrastructure | Docker + Docker Compose |
 
 ---
 
@@ -47,7 +79,9 @@ cp .env.example .env
 # Edit .env — set DB_PASSWORD at minimum
 ```
 
-### 3. Start the database
+Edit `.env` and set at minimum `DB_PASSWORD`. Tune the thresholds if needed (see [Threshold tuning](#threshold-tuning) below).
+
+### 4. Start the database
 
 ```bash
 docker compose up -d
@@ -75,7 +109,13 @@ pip install -r requirements.txt
 python download_model.py
 ```
 
-### 7. Enroll staff
+---
+
+## Usage
+
+### Enroll new employees
+
+![Enrollment flow](docs/enrollment_flow.png)
 
 ```bash
 # Permanent employee
@@ -85,7 +125,15 @@ python enroll_employee.py
 python enroll_visitor.py
 ```
 
-### 8. Run the camera
+Opens the camera. Type an Employee ID in the terminal, align the face inside the oval guide, and press **Space** to capture. The embedding is saved to both the `embeddings/` folder and PostgreSQL.
+
+| Key | Action |
+|-----|--------|
+| `Space` | Capture and enroll |
+| `R` | Retake / new ID |
+| `Q` / `ESC` | Quit |
+
+### Run live recognition with attendance logging
 
 ```bash
 python live_camera.py
@@ -104,62 +152,18 @@ python live_camera.py --no-liveness
 | `Q` / `ESC` | Quit |
 | `S` | Save screenshot → `screenshots/` |
 | `P` | Pause / resume |
-| `L` | Print today's log to terminal |
-| `E` | Export full log as CSV |
+| `L` | Print today's attendance in terminal |
+| `E` | Export full attendance log to CSV |
 
----
+Optional flags:
 
-## 🎨 Visual Legend
-
-| Colour | Meaning |
-|--------|---------|
-| 🟢 **Green** | Employee verified — gate open |
-| 🔵 **Blue** | Frequent visitor verified |
-| 🟠 **Orange** | Low confidence — re-enroll recommended |
-| 🩵 **Cyan** | New / unknown visitor — fill details in terminal |
-| 🟡 **Yellow** | Spoof detected — access denied |
-
----
-
-## 🔧 Configuration (`.env`)
-
-```env
-DB_HOST=localhost
-DB_NAME=visit_db
-DB_USER=postgres
-DB_PASSWORD=your_strong_password_here
-DB_PORT=55432
-
-LIVENESS_THRESHOLD=0.5    # below = spoof (0.0–1.0)
-MATCH_THRESHOLD=0.35      # cosine distance — below = confirmed match
-LOW_CONF_THRESHOLD=0.55   # between MATCH and this = low confidence
+```bash
+python live_camera_with_log.py --camera 1        # use camera index 1
+python live_camera_with_log.py --no-liveness     # disable anti-spoof check
+python live_camera_with_log.py --width 1920 --height 1080
 ```
 
----
-
-## 📁 File Map
-
-```
-face-rec-v2/
-├── .env.example              # copy to .env and fill in passwords
-├── docker-compose.yml        # pgvector/pgvector:pg17 service
-├── db_setup.sql              # creates all 4 tables + indexes
-├── requirements.txt
-│
-├── download_model.py         # one-time: downloads buffalo_l model
-├── enroll_employee.py        # webcam enrollment for staff
-├── enroll_visitor.py         # webcam enrollment for frequent visitors
-├── convert_npy_to_psql.py    # migrate legacy .npy embeddings to DB
-│
-├── live_camera.py            # main recognition loop
-└── visit_log.py              # VisitLogger class + CLI viewer/exporter
-```
-
----
-
-## 🗂️ Migrating Legacy `.npy` Embeddings
-
-If you have existing embeddings stored as `.npy` files:
+### View or export attendance
 
 ```bash
 # Point EMBEDDING_FOLDER in .env to your folder, then:
@@ -168,47 +172,92 @@ python convert_npy_to_psql.py
 
 ---
 
-## 📊 Log Viewer
+## Enrollment pipeline (batch from images)
+
+Run in order when enrolling from a folder of existing photos:
 
 ```bash
-# Print today's attendance
-python visit_log.py --today
-
-# Export full log as CSV
-python visit_log.py --export
+python create_embeddings.py      # generate .npy embeddings from faces/
+python naming.py                 # anonymise filenames
+python convert_npy_to_psql.py   # insert into database
 ```
 
 ---
 
-## 🛠️ Development Notes
+## Threshold tuning
 
-- Recognition runs every **15 frames** in a background thread to keep the video feed smooth.
-- New visitor terminal prompts run in a daemon thread — the camera never blocks.
-- The `attendance_log` has a **60-second cooldown** per person to avoid duplicate entries.
-- The `promoted` column in `new_visitor_log` lets you mark walk-ins who were later enrolled as frequent visitors.
+![Threshold diagram](docs/thresholds.png)
 
----
+All thresholds are set in `.env`:
 
-## 📋 Requirements
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MATCH_THRESHOLD` | `0.35` | Cosine distance below this → **Existing Employee** (green) |
+| `LOW_CONF_THRESHOLD` | `0.55` | Distance between MATCH and this → **Low Confidence** (orange); above this → **New Employee** (cyan) |
+| `LIVENESS_THRESHOLD` | `0.5` | Anti-spoof score below this → **Spoof** (yellow) |
 
-- `insightface >= 0.7.3`
-- `opencv-python >= 4.8.0`
-- `psycopg2-binary >= 2.9.9`
-- `pgvector >= 0.2.4`
-- `onnxruntime >= 1.17.0`
-- `python-dotenv >= 1.0.0`
-- `numpy >= 1.24.0`
+**Tips:**
+- Lower `MATCH_THRESHOLD` (e.g. `0.30`) → stricter matching, fewer false positives
+- Raise `LOW_CONF_THRESHOLD` (e.g. `0.65`) → wider "maybe existing" band before classifying as new
+- If anti-spoof is too aggressive in poor lighting, raise `LIVENESS_THRESHOLD` slightly or use `--no-liveness`
 
 ---
 
-## 🔒 Security Notes
+## Configuration reference
 
-- Never commit your `.env` file — it's in `.gitignore`
-- Change the default `DB_PASSWORD` before deployment
-- The liveness (anti-spoof) check is enabled by default; only disable with `--no-liveness` for testing
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DB_HOST` | localhost | PostgreSQL host |
+| `DB_NAME` | visit_db | Database name |
+| `DB_USER` | postgres | DB user |
+| `DB_PASSWORD` | — | Required |
+| `DB_PORT` | 55432 | Exposed port |
+| `IMAGE_FOLDER` | faces | Source JPEG folder for batch enrollment |
+| `EMBEDDING_FOLDER` | embeddings | `.npy` face vector storage |
+| `LIVENESS_THRESHOLD` | 0.5 | Anti-spoof cutoff (0–1) |
+| `MATCH_THRESHOLD` | 0.35 | Cosine distance cutoff for verified match |
+| `LOW_CONF_THRESHOLD` | 0.55 | Upper distance bound before classifying as new employee |
 
 ---
 
-## 📜 License
+## Database schema
 
-MIT
+```sql
+CREATE TABLE employee_embeddings (
+    emp_id    TEXT PRIMARY KEY,
+    embedding VECTOR(512)
+);
+
+CREATE TABLE attendance_log (
+    id         SERIAL PRIMARY KEY,
+    emp_id     TEXT        NOT NULL,
+    seen_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    distance   FLOAT,
+    camera_idx INTEGER DEFAULT 0
+);
+```
+
+---
+
+## Project structure
+
+```
+Face-rec/
+├── live_camera_with_log.py   Main production script — camera + recognition + logging
+├── enroll_camera.py          Live enrollment via webcam
+├── attendance_log.py         Attendance viewer / exporter
+├── create_embeddings.py      Batch embedding generation from image folder
+├── naming.py                 Anonymise embedding filenames
+├── convert_npy_to_psql.py   Migrate .npy files to PostgreSQL
+├── download_model.py         Download ArcFace model weights
+├── encrypted_embeddings.py   Encrypted embedding storage (optional)
+├── docker-compose.yml
+├── requirements.txt
+├── .env.example
+├── visit_db.sql              Database schema seed
+├── docs/                     README diagrams
+├── faces/                    Source images (batch enrollment)
+├── embeddings/               .npy face vectors
+├── enrolled_photos/          Reference photos saved during enrollment
+└── screenshots/              Camera captures (S key)
+```
