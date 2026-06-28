@@ -29,6 +29,8 @@ except psycopg2.OperationalError as e:
 register_vector(conn)
 cursor = conn.cursor()
 print("Connected")
+if not os.path.exists(EMBEDDING_FOLDER):
+    os.makedirs(EMBEDDING_FOLDER, exist_ok=True)
 files = sorted(f for f in os.listdir(EMBEDDING_FOLDER) if f.endswith(".npy"))
 total = len(files)
 print(f"Found {total} .npy files to insert")
